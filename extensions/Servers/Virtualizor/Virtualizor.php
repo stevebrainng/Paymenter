@@ -216,7 +216,6 @@ class Virtualizor extends Server
             'virt' => $settings['virt'],
             'uid' => $user['uid'],
             'osid' => $settings['os'],
-            'server_group' => 0,
             'hostname' => $settings['hostname'],
             'rootpass' => $password,
             'num_ips6' => isset($settings['ips6']) ? $settings['ips6'] : $plan['ips6'],
@@ -241,8 +240,8 @@ class Virtualizor extends Server
 
         $response = $this->request('addvs', 'post', $data);
 
-        if (!$response['done']) {
-            throw new \Exception('Failed to create server');
+        if (isset($response['error']) && !empty($response['error'])) {
+            throw new \Exception('Failed to create server with error: ' . implode(', ', $response['error']));
         }
 
         $service->properties()->updateOrCreate([
@@ -310,7 +309,11 @@ class Virtualizor extends Server
         }
 
         // Terminate server
-        $this->request('vs', 'post', ['delete' => $properties['server_id']]);
+        $request = $this->request('vs', 'post', ['delete' => $properties['server_id']]);
+
+        if (empty($request['done']) || !$request['done']) {
+            throw new \Exception('Failed to terminate server');
+        }
 
         // Remove server id
         $service->properties()->where('key', 'server_id')->delete();

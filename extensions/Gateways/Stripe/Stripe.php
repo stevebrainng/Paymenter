@@ -4,10 +4,13 @@ namespace Paymenter\Extensions\Gateways\Stripe;
 
 use App\Classes\Extension\Gateway;
 use App\Events\Service\Updated;
+use App\Events\ServiceCancellation\Created;
 use App\Helpers\ExtensionHelper;
 use App\Models\Gateway as ModelsGateway;
 use App\Models\Invoice;
 use App\Models\Service;
+use Carbon\Carbon;
+use Exception;
 use Filament\Notifications\Notification;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Event;
@@ -27,11 +30,32 @@ class Stripe extends Gateway
                 // If the service is not a stripe subscription, skip
                 return;
             }
-            if ($event->service->isDirty('price')) {
+            if ($event->service->isDirty('price') || $event->service->isDirty('expires_at')) {
                 try {
                     $this->updateSubscription($event->service);
-                } catch (\Exception $e) {
+                } catch (Exception $e) {
                 }
+            }
+            // Check if the service is canceled
+            if ($event->service->isDirty('status') && $event->service->status === Service::STATUS_CANCELLED) {
+                try {
+                    $this->cancelSubscription($event->service);
+                } catch (Exception $e) {
+                    // Ignore exception
+                }
+            }
+        });
+
+        Event::listen(Created::class, function (Created $event) {
+            $service = $event->cancellation->service;
+            if ($service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$service->subscription_id) {
+                // If the service is not a stripe subscription, skip
+                return;
+            }
+            try {
+                $this->cancelSubscription($service);
+            } catch (Exception $e) {
+                // Ignore exception
             }
         });
     }
@@ -99,6 +123,7 @@ class Stripe extends Gateway
                 'invoice.created',
                 'invoice.payment_succeeded',
             ],
+            'api_version' => '2025-02-24.acacia', // Use the latest version
         ]);
 
         $gateway->settings()->updateOrCreate(['key' => 'stripe_webhook_secret'], ['value' => $webhook->secret]);
@@ -127,7 +152,10 @@ class Stripe extends Gateway
             if ($stripeCustomerId) {
                 try {
                     $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
-                } catch (\Exception $e) {
+                    if ($customer->deleted) {
+                        $customer = null;
+                    }
+                } catch (Exception $e) {
                     // Customer not found, create a new one
                 }
             }
@@ -240,7 +268,7 @@ class Stripe extends Gateway
         $stripeCustomerId = $user->properties->where('key', 'stripe_id')->first();
         // Create customer if not exists
         if (!$stripeCustomerId) {
-            throw new \Exception('Stripe customer not found', $user);
+            throw new Exception('Stripe customer not found', $user);
         } else {
             $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
         }
@@ -252,7 +280,7 @@ class Stripe extends Gateway
 
         // Create subscription
         foreach ($invoice->items as $item) {
-            if (!$item->reference_type === Service::class) {
+            if ($item->reference_type !== Service::class) {
                 continue;
             }
             $service = $item->reference;
@@ -273,7 +301,7 @@ class Stripe extends Gateway
 
             $phases = [];
             // Check if current invoice item price is bigger then service price (then we have a setup fee)
-            if ($item->price > $service->price) {
+            if ($item->price != $service->price) {
                 $phases[] = [
                     'items' => [
                         [
@@ -291,8 +319,9 @@ class Stripe extends Gateway
                     ],
                     'iterations' => 1,
                     'metadata' => [
-                        'service_id' => $product->id,
+                        'service_id' => $service->id,
                     ],
+                    'proration_behavior' => 'none',
                 ];
             }
             $phases[] = [
@@ -311,13 +340,14 @@ class Stripe extends Gateway
                     ],
                 ],
                 'metadata' => [
-                    'service_id' => $product->id,
+                    'service_id' => $service->id,
                 ],
+                'proration_behavior' => 'none',
             ];
 
             $subscription = $this->request('post', '/subscription_schedules', [
                 'customer' => $customer->id,
-                'start_date' => 'now',
+                'start_date' => now()->startOfDay()->timestamp,
                 'phases' => $phases,
                 'metadata' => ['service_id' => $service->id],
             ]);
@@ -332,67 +362,106 @@ class Stripe extends Gateway
     {
         // Grab the schedule from Stripe
         $scheduleId = $this->request('get', '/subscriptions/' . $service->subscription_id);
-        if ($scheduleId->schedule) {
 
-            $oldPhases = $this->request('get', '/subscription_schedules/' . $scheduleId->schedule)->phases;
-            // Overwrite phase 2 item 0 with the new price
-            $phases = [];
-            // Only keep items and end, start date
-            foreach ($oldPhases as $phase) {
-                $phases[] = [
-                    'items' => $phase->items,
-                    'end_date' => $phase->end_date,
-                    'start_date' => $phase->start_date,
-                ];
-            }
-            // Check if the service->product already exists in Stripe
-            $product = $service->product;
-            $stripeProduct = $this->request('get', '/products/search', ['query' => 'metadata[\'product_id\']:\'' . $product->id . '\'']);
+        if ($service->isDirty('price')) {
+            if ($scheduleId->schedule) {
 
-            if (empty($stripeProduct->data)) {
-                // Create product
-                $stripeProduct = $this->request('post', '/products', [
-                    'name' => $product->name,
-                    'metadata' => ['product_id' => $product->id],
-                ]);
-            } else {
-                $stripeProduct = $stripeProduct->data[0];
-            }
-            // Latest phase is the current one
-            $key = count($phases) - 1;
-            $phases[$key]['items'][0]->price_data = [
-                'currency' => $service->currency->code,
-                'unit_amount' => $service->price * 100,
-                'product' => $stripeProduct->id,
-                'recurring' => [
-                    'interval' => $service->plan->billing_unit,
-                    'interval_count' => $service->plan->billing_period,
-                ],
-            ];
-            $phases[$key]['items'][0]->price = null;
-            $phases[$key]['items'][0]->plan = null;
+                $oldPhases = $this->request('get', '/subscription_schedules/' . $scheduleId->schedule)->phases;
+                // Overwrite phase 2 item 0 with the new price
+                $phases = [];
+                // Only keep items and end, start date
+                foreach ($oldPhases as $phase) {
+                    $phases[] = [
+                        'items' => $phase->items,
+                        'end_date' => $phase->end_date,
+                        'start_date' => $phase->start_date,
+                    ];
+                }
+                // Check if the service->product already exists in Stripe
+                $product = $service->product;
+                $stripeProduct = $this->request('get', '/products/search', ['query' => 'metadata[\'product_id\']:\'' . $product->id . '\'']);
 
-            // Update the schedule
-            $this->request('post', '/subscription_schedules/' . $scheduleId->schedule, [
-                'phases' => $phases,
-                'proration_behavior' => 'none',
-            ]);
-        } else {
-            // Get subscription
-            $subscription = $this->request('get', '/subscriptions/' . $service->subscription_id);
-            // Get first item
-            $item = $subscription->items->data[0];
-            // Update price
-            $this->request('post', '/subscription_items/' . $item->id, [
-                'price_data' => [
+                if (empty($stripeProduct->data)) {
+                    // Create product
+                    $stripeProduct = $this->request('post', '/products', [
+                        'name' => $product->name,
+                        'metadata' => ['product_id' => $product->id],
+                    ]);
+                } else {
+                    $stripeProduct = $stripeProduct->data[0];
+                }
+                // Latest phase is the current one
+                $key = count($phases) - 1;
+                $phases[$key]['items'][0]->price_data = [
                     'currency' => $service->currency->code,
                     'unit_amount' => $service->price * 100,
-                    'product' => $item->price->product,
+                    'product' => $stripeProduct->id,
                     'recurring' => [
                         'interval' => $service->plan->billing_unit,
                         'interval_count' => $service->plan->billing_period,
                     ],
-                ],
+                ];
+                $phases[$key]['items'][0]->price = null;
+                $phases[$key]['items'][0]->plan = null;
+
+                // Update the schedule
+                $this->request('post', '/subscription_schedules/' . $scheduleId->schedule, [
+                    'phases' => $phases,
+                    'proration_behavior' => 'none',
+                ]);
+            } else {
+                // Get subscription
+                $subscription = $this->request('get', '/subscriptions/' . $service->subscription_id);
+                // Get first item
+                $item = $subscription->items->data[0];
+                // Update price
+                $this->request('post', '/subscription_items/' . $item->id, [
+                    'price_data' => [
+                        'currency' => $service->currency->code,
+                        'unit_amount' => $service->price * 100,
+                        'product' => $item->price->product,
+                        'recurring' => [
+                            'interval' => $service->plan->billing_unit,
+                            'interval_count' => $service->plan->billing_period,
+                        ],
+                    ],
+                    'proration_behavior' => 'none',
+                ]);
+            }
+        }
+
+        if ($service->isDirty('expires_at')) {
+            $subDate = Carbon::createFromTimestamp($scheduleId->current_period_end)->startOfDay();
+            // Check if current date is before the end date of the subscription
+            if ($subDate == $service->expires_at || $service->expires_at <= $subDate) {
+                return;
+            }
+
+            if ($scheduleId->schedule) {
+                // As phases are only used for the setup fee, we can remove the phases
+                $this->request('post', '/subscription_schedules/' . $scheduleId->schedule . '/release', []);
+
+                // Get subscription
+                $subscription = $this->request('get', '/subscriptions/' . $service->subscription_id);
+                // Get first item
+                $item = $subscription->items->data[0];
+                // Update price
+                $this->request('post', '/subscription_items/' . $item->id, [
+                    'price_data' => [
+                        'currency' => $service->currency->code,
+                        'unit_amount' => $service->price * 100,
+                        'product' => $item->price->product,
+                        'recurring' => [
+                            'interval' => $service->plan->billing_unit,
+                            'interval_count' => $service->plan->billing_period,
+                        ],
+                    ],
+                    'proration_behavior' => 'none',
+                ]);
+            }
+            // Update the subscription
+            $this->request('post', '/subscriptions/' . $service->subscription_id, [
+                'trial_end' => $service->expires_at->timestamp,
                 'proration_behavior' => 'none',
             ]);
         }
@@ -404,6 +473,11 @@ class Stripe extends Gateway
             return;
         }
         $this->request('delete', '/subscriptions/' . $service->subscription_id);
+
+        // Remove subscription id from service
+        $service->update(['subscription_id' => null]);
+        // Remove has_stripe_subscription property
+        $service->properties()->where('key', 'has_stripe_subscription')->delete();
 
         return true;
     }

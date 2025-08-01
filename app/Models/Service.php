@@ -174,8 +174,7 @@ class Service extends Model
     public function upgradable(): Attribute
     {
         return Attribute::make(
-            get: fn () => $this->productUpgrades()->count() > 0 && $this->status == 'active' && !$this->upgrade?->where('status', ServiceUpgrade::STATUS_PENDING)->exists()
-        );
+            get: fn () => ($this->productUpgrades()->count() > 0 || $this->product->upgradableConfigOptions()->count() > 0) && $this->status == 'active' && $this->upgrade->where('status', ServiceUpgrade::STATUS_PENDING)->count() == 0);
     }
 
     public function productUpgrades()
@@ -193,8 +192,22 @@ class Service extends Model
         });
     }
 
+    public function recalculatePrice()
+    {
+        // Calculate the price based on the plan and quantity and config options
+        $price = $this->plan->price()->price * $this->quantity;
+        $this->configs->each(function ($config) use (&$price) {
+            $configValue = $config->configValue;
+            if ($configValue) {
+                $price += $configValue->price(null, $this->plan->billing_period, $this->plan->billing_unit, $this->currency_code)->price;
+            }
+        });
+        $this->price = $price;
+        $this->save();
+    }
+
     public function upgrade()
     {
-        return $this->hasOne(ServiceUpgrade::class);
+        return $this->hasMany(ServiceUpgrade::class);
     }
 }

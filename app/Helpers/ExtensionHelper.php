@@ -10,27 +10,31 @@ use App\Models\Product;
 use App\Models\Server;
 use App\Models\Service;
 use Exception;
+use Filament\Forms\Components\Placeholder;
 use Illuminate\Support\Facades\Cache;
 
 class ExtensionHelper
 {
     /**
-     * Used to read all Extensions in app/Extensions with or without type (e.g. 'gateway' or 'server')
+     * Used to read all Extensions in app/Extensions with or without type (e.g. 'gateway' or 'server' or 'other' (for non-gateway/server extensions))
      *
      * @param  string|null  $type
      * @return array
      */
-    private static function getExtensions($type)
+    public static function getExtensions($type = null)
     {
-        // Read app/Extensions directory
-        $availableExtensions = array_diff(scandir(base_path('extensions/' . ucfirst($type . 's'))), ['..', '.']);
+        // Check how long this takes
+        $extensions = self::getAvailableExtensions();
 
-        // Read settings
-        foreach ($availableExtensions as $key => $extension) {
-            $extensions[] = [
-                'name' => $extension,
-                'settings' => self::getConfig($type, $extension),
-            ];
+        if ($type && $type == 'other') {
+            // Filter out gateways and servers
+            $extensions = array_filter($extensions, fn ($extension) => !in_array($extension['type'], ['gateway', 'server']));
+
+            return $extensions;
+        } elseif ($type) {
+            $type = strtolower($type);
+
+            return array_filter($extensions, fn ($extension) => $extension['type'] === $type);
         }
 
         return $extensions;
@@ -63,14 +67,16 @@ class ExtensionHelper
      *
      * @return array
      */
-    public static function getConfig($type, $extension)
+    public static function getConfig($type, $extension, $config = [])
     {
-        $typeClass = ($type == 'gateway') ? Gateway::class : Server::class;
-        $currentConfig = $typeClass::where('extension', $extension)->exists()
-            ? $typeClass::where('extension', $extension)->first()->settings->pluck('value', 'key')->toArray()
-            : [];
+        if (empty($config)) {
+            $typeClass = ($type == 'gateway') ? Gateway::class : (($type == 'server') ? Server::class : Extension::class);
+            $config = $typeClass::where('extension', $extension)->exists()
+                ? $typeClass::where('extension', $extension)->first()->settings->pluck('value', 'key')->toArray()
+                : [];
+        }
 
-        return self::getExtension($type, $extension)->getConfig($currentConfig);
+        return self::getExtension($type, $extension)->getConfig($config);
     }
 
     /**
@@ -99,34 +105,14 @@ class ExtensionHelper
      *
      * @return array
      */
-    public static function getCheckoutConfig(Product $product)
+    public static function getCheckoutConfig(Product $product, $values = [])
     {
         $server = $product->server;
         if (!$server) {
             return [];
         }
 
-        return self::call($server, 'getCheckoutConfig', [$product], mayFail: true) ?? [];
-    }
-
-    /**
-     * Get available gateways
-     *
-     * @return array
-     */
-    public static function getAvailableGateways()
-    {
-        return self::getExtensions('gateway');
-    }
-
-    /**
-     * Get available servers
-     *
-     * @return array
-     */
-    public static function getAvailableServers()
-    {
-        return self::getExtensions('server');
+        return self::call($server, 'getCheckoutConfig', [$product, $values, self::settingsToArray($product->settings)], mayFail: true) ?? [];
     }
 
     /**
@@ -138,25 +124,60 @@ class ExtensionHelper
     {
         $extensions = [];
 
-        foreach (scandir(base_path('extensions')) as $extension) {
-            if (in_array($extension, ['.', '..', 'Gateways', 'Servers'])) {
+        $classmap = require_once base_path('vendor/composer/autoload_classmap.php');
+
+        // Magic code so we can also support extensions that don't reside in the extensions folder
+        foreach ($classmap as $class => $path) {
+            if (strpos($class, 'Paymenter\\Extensions\\') !== 0) {
                 continue;
             }
 
-            $type = strtolower($extension);
-            // Remove the 's' from  end of the type
-            $type = substr($type, 0, -1);
+            // Example: Paymenter\Extensions\Whatevers\SomeExtension\SomeExtension
+            $parts = explode('\\', $class);
 
-            foreach (scandir(base_path('extensions/' . $extension)) as $extension) {
-                if (in_array($extension, ['.', '..'])) {
+            // Must have at least: Paymenter, Extensions, <Type>s, <Name>, <Class>
+            if (count($parts) < 5) {
+                continue;
+            }
+
+            $typePlural = $parts[2];
+
+            $type = strtolower(rtrim($typePlural, 's'));
+            $name = $parts[3];
+
+            // Only add the main extension class (class name matches extension folder)
+            if ($parts[4] !== $name) {
+                continue;
+            }
+
+            $extensions[] = [
+                'name' => $name,
+                'type' => $type,
+            ];
+        }
+
+        // Newly created extensions sometimes don't have a classmap entry, so we also check the filesystem
+        $extensionPath = base_path('extensions');
+        $typeFolders = glob($extensionPath . '/*', GLOB_ONLYDIR);
+        foreach ($typeFolders as $typeFolder) {
+            $type = strtolower(rtrim(basename($typeFolder), 's'));
+            $extensionDirs = glob($typeFolder . '/*', GLOB_ONLYDIR);
+
+            foreach ($extensionDirs as $extensionDir) {
+                $name = basename($extensionDir);
+
+                // CHeck if already added
+                if (in_array($name, array_column($extensions, 'name')) && in_array($type, array_column($extensions, 'type'))) {
                     continue;
                 }
 
-                $extensions[] = [
-                    'name' => $extension,
-                    'type' => $type,
-                    'settings' => self::getConfig($type, $extension),
-                ];
+                // Check if the class exists
+                if (class_exists('\\Paymenter\\Extensions\\' . ucfirst($type) . 's\\' . $name . '\\' . $name)) {
+                    $extensions[] = [
+                        'name' => $name,
+                        'type' => $type,
+                    ];
+                }
             }
         }
 
@@ -196,22 +217,28 @@ class ExtensionHelper
     /**
      * Convert extensions to options
      *
-     * @param  array  $extensions
+     * @param  Extension  $extension
      * @return object
      */
-    public static function convertToOptions($extensions)
+    public static function getConfigAsInputs(string $type, ?string $name, $config = [])
     {
-        $options = [];
-        $settings = ['default' => []];
-        foreach ($extensions as $extension) {
-            $options[$extension['name']] = $extension['name'];
-            foreach ($extension['settings'] as $setting) {
-                $setting['name'] = 'settings.' . $setting['name'];
-                $settings[$extension['name']][] = FilamentInput::convert($setting, true);
-            }
+        if (!$name) {
+            return [];
         }
 
-        return (object) ['options' => $options, 'settings' => $settings];
+        $settings = [];
+
+        try {
+            foreach (self::getConfig($type, $name, $config) as $key => $config) {
+                $config['name'] = 'settings.' . $config['name'];
+                $settings[] = FilamentInput::convert($config);
+            }
+        } catch (\Exception $e) {
+            $settings[] = Placeholder::make('error')->content($e->getMessage());
+            // Handle exception
+        }
+
+        return $settings;
     }
 
     /**
@@ -222,6 +249,24 @@ class ExtensionHelper
     public static function getProductConfig($server, $values = [])
     {
         return self::call($server, 'getProductConfig', [$values]);
+    }
+
+    protected static function prepareForSerialization($values)
+    {
+        if (is_array($values)) {
+            foreach ($values as $key => $value) {
+                $values[$key] = self::prepareForSerialization($value);
+            }
+
+            return $values;
+        }
+
+        if ($values instanceof \Livewire\Features\SupportFileUploads\TemporaryUploadedFile) {
+            // Store the file and use the path, or just use the filename if already stored
+            return $values->getRealPath() ?: (string) $values;
+        }
+
+        return $values;
     }
 
     /**
@@ -235,7 +280,7 @@ class ExtensionHelper
 
         $config = Cache::get('product_config', []);
 
-        $key = $server->extension . $server->id . md5(serialize($values));
+        $key = $server->extension . $server->id . md5(serialize(self::prepareForSerialization($values)));
 
         if (!isset($config[$key])) {
             $config[$key] = self::getProductConfig($server, $values);
@@ -292,7 +337,7 @@ class ExtensionHelper
 
         foreach (Gateway::all() as $gateway) {
             if (self::hasFunction($gateway, 'canUseGateway')) {
-                if (self::getExtension('gateway', $gateway, $gateway->settings)->canUseGateway($items, $type)) {
+                if (self::getExtension('gateway', $gateway->extension, $gateway->settings)->canUseGateway($items, $type)) {
                     $gateways[] = $gateway;
                 }
             } else {
@@ -338,11 +383,6 @@ class ExtensionHelper
                     'fee' => $fee,
                 ]
             );
-        }
-
-        if ($invoice->remaining <= 0 && $invoice->status !== 'paid') {
-            $invoice->status = 'paid';
-            $invoice->save();
         }
     }
 
@@ -461,8 +501,10 @@ class ExtensionHelper
      */
     public static function getView(Service $service, $view)
     {
-        $server = self::checkServer($service, 'getView');
+        $function = isset($view['function']) ? $view['function'] : 'getView';
 
-        return self::getExtension('server', $server->extension, $server->settings)->getView($service, self::settingsToArray($service->product->settings), self::getServiceProperties($service), $view);
+        $server = self::checkServer($service, $function);
+
+        return self::getExtension('server', $server->extension, $server->settings)->$function($service, self::settingsToArray($service->product->settings), self::getServiceProperties($service), $view['name']);
     }
 }

@@ -97,11 +97,13 @@
                             {{ __('navigation.login') }}
                         </x-button.secondary>
                     </a>
+                    @if(!config('settings.registration_disabled', false))
                     <a href="{{ route('register') }}" wire:navigate>
                         <x-button.primary>
                             {{ __('navigation.register') }}
                         </x-button.primary>
                     </a>
+                    @endif
                 </div>
                 @endif
                 <button
@@ -222,11 +224,13 @@
 
                             @else
                             <div class="flex flex-col gap-3 mb-3">
+                                @if(!config('settings.registration_disabled', false))
                                 <a href="{{ route('register') }}" wire:navigate>
                                     <x-button.primary>
                                         {{ __('navigation.register') }}
                                     </x-button.primary>
                                 </a>
+                                @endif
                                 <a href="{{ route('login') }}" wire:navigate>
                                     <x-button.secondary>
                                         {{ __('navigation.login') }}

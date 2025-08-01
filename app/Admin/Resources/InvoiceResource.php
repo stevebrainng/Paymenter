@@ -2,12 +2,13 @@
 
 namespace App\Admin\Resources;
 
+use App\Admin\Components\UserComponent;
 use App\Admin\Resources\InvoiceResource\Pages;
 use App\Admin\Resources\InvoiceResource\RelationManagers;
 use App\Models\Currency;
 use App\Models\Invoice;
 use App\Models\Service;
-use App\Models\User;
+use App\Models\ServiceUpgrade;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Forms\Get;
@@ -17,7 +18,6 @@ use Filament\Tables;
 use Filament\Tables\Filters\SelectFilter;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Support\HtmlString;
 
 class InvoiceResource extends Resource
 {
@@ -43,16 +43,7 @@ class InvoiceResource extends Resource
     {
         return $form
             ->schema([
-                Forms\Components\Select::make('user_id')
-                    ->label('User')
-                    ->relationship('user', 'id')
-                    ->searchable()
-                    ->preload()
-                    ->getOptionLabelFromRecordUsing(fn ($record) => $record->name)
-                    ->getSearchResultsUsing(fn (string $search): array => User::where('first_name', 'like', "%$search%")->orWhere('last_name', 'like', "%$search%")->limit(50)->pluck('name', 'id')->toArray())
-                    ->hint(fn ($get) => $get('user_id') ? new HtmlString('<a href="' . UserResource::getUrl('edit', ['record' => $get('user_id')]) . '" target="_blank">Go to User</a>') : null)
-                    ->live()
-                    ->required(),
+                UserComponent::make('user_id'),
                 Forms\Components\TextInput::make('number')
                     ->label('Invoice Number')
                     ->helperText('The invoice number will be generated automatically')
@@ -116,20 +107,10 @@ class InvoiceResource extends Resource
                             ->hintAction(
                                 Forms\Components\Actions\Action::make('View Service')
                                     ->url(function (Get $get) {
-                                        if ($get('reference_type') === Service::class) {
-                                            return ServiceResource::getUrl('edit', ['record' => $get('reference_id')]);
-                                        } else {
-                                            return null;
-                                        }
+                                        return ServiceResource::getUrl('edit', ['record' => $get('reference_id')]);
                                     })
-                                    ->label(function (Get $get) {
-                                        if ($get('reference_type') === Service::class) {
-                                            return 'View Service';
-                                        } else {
-                                            return null;
-                                        }
-                                    })
-                                    ->hidden(fn (Get $get): bool => !$get('reference_id'))
+                                    ->label('View Service')
+                                    ->hidden(fn (Get $get): bool => !in_array($get('reference_type'), [Service::class, ServiceUpgrade::class]))
                             )
                             ->placeholder('Enter the description of the product'),
                         Forms\Components\Hidden::make('reference_type'),

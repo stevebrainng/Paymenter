@@ -6,6 +6,7 @@ use App\Models\Setting;
 use App\Models\TaxRate;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\HtmlString;
+use Ramsey\Uuid\Uuid;
 
 class Settings
 {
@@ -113,6 +114,7 @@ class Settings
                     'label' => 'Google Enabled',
                     'description' => new HtmlString('<a href="https://paymenter.org/docs/guides/OAuth#google" target="_blank">Documentation</a>'),
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => false,
                     'required' => false,
                 ],
@@ -133,6 +135,7 @@ class Settings
                     'label' => 'GitHub Enabled',
                     'description' => new HtmlString('<a href="https://paymenter.org/docs/guides/OAuth#github" target="_blank">Documentation</a>'),
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => false,
                     'required' => false,
                 ],
@@ -153,6 +156,7 @@ class Settings
                     'label' => 'Discord Enabled',
                     'description' => new HtmlString('<a href="https://paymenter.org/docs/guides/OAuth#discord" target="_blank">Documentation</a>'),
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => false,
                     'required' => false,
                 ],
@@ -235,6 +239,7 @@ class Settings
                     'name' => 'tax_enabled',
                     'label' => 'Tax Enabled',
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => false,
                 ],
                 [
@@ -254,12 +259,14 @@ class Settings
                     'name' => 'mail_disable',
                     'label' => 'Disable Mail',
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => true,
                 ],
                 [
                     'name' => 'mail_must_verify',
                     'label' => 'Users must verify email before buying',
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => false,
                 ],
                 [
@@ -402,6 +409,7 @@ class Settings
                     'name' => 'credits_enabled',
                     'label' => 'Credits Enabled',
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => false,
                 ],
                 [
@@ -500,6 +508,22 @@ class Settings
                     'database_type' => 'array',
                 ],
                 [
+                    'name' => 'registration_disabled',
+                    'label' => 'Disable User Registration',
+                    'type' => 'checkbox',
+                    'database_type' => 'boolean',
+                    'default' => false,
+                    'description' => 'Only allow existing users to log in. This will hide the registration page and prevent new users from signing up.',
+                ],
+                [
+                    'name' => 'tickets_disabled',
+                    'label' => 'Disable Tickets',
+                    'type' => 'checkbox',
+                    'database_type' => 'boolean',
+                    'default' => false,
+                    'description' => 'Disable the ticket system. This will disable all client side ticket functionality, including the ability to create new tickets and view existing tickets.',
+                ],
+                [
                     'name' => 'pagination',
                     'label' => 'Pagination',
                     'type' => 'number',
@@ -511,6 +535,7 @@ class Settings
                     'name' => 'debug',
                     'label' => 'Debug Mode',
                     'type' => 'checkbox',
+                    'database_type' => 'boolean',
                     'default' => false,
                     'description' => 'Enable debug mode to log HTTP requests and errors',
                 ],
@@ -525,10 +550,15 @@ class Settings
 
     public static function tax()
     {
-        $country = Auth::user()->country ?? null;
-
         // Use once so the query is only run once
-        return once(function () use ($country) {
+        return once(function () {
+            $country = Auth::user()?->properties()->where('key', 'country')->value('value') ?? null;
+
+            // Change country to a two-letter country code if it's not already
+            if ($country) {
+                $country = array_search($country, config('app.countries')) ?: $country;
+            }
+
             if ($taxRate = TaxRate::where('country', $country)->first()) {
                 return $taxRate;
             } elseif ($taxRate = TaxRate::where('country', 'all')->first()) {
@@ -550,5 +580,32 @@ class Settings
         $setting->value = Setting::where('settingable_type', null)->where('key', $key)->value('value') ?? $setting->default ?? null;
 
         return $setting;
+    }
+
+    public static function getTelemetry()
+    {
+        try {
+            $uuid = Setting::where('key', 'telemetry_uuid')->value('value');
+        } catch (\Exception $e) {
+            $uuid = null;
+        }
+        if (is_null($uuid)) {
+            $uuid = Uuid::uuid4()->toString();
+            try {
+                Setting::updateOrCreate(
+                    ['key' => 'telemetry_uuid'],
+                    ['value' => $uuid]
+                );
+            } catch (\Exception $e) {
+                // Avoid errors in workflows
+            }
+        }
+
+        // Daily fixed time based on UUID
+        $time = hexdec(str_replace('-', '', substr($uuid, 27))) % 1440;
+        $hour = floor($time / 60);
+        $minute = $time % 60;
+
+        return compact('uuid', 'hour', 'minute');
     }
 }

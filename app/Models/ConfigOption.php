@@ -19,6 +19,7 @@ class ConfigOption extends Model
         'sort',
         'hidden',
         'parent_id',
+        'upgradable',
     ];
 
     /**
@@ -34,7 +35,7 @@ class ConfigOption extends Model
      */
     public function children()
     {
-        return $this->hasMany(ConfigOption::class, 'parent_id');
+        return $this->hasMany(ConfigOption::class, 'parent_id')->orderBy('sort');
     }
 
     /**
